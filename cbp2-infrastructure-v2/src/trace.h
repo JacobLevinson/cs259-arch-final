@@ -5,9 +5,9 @@
 // plain files.  If they are somewhere else on your system, change these
 // definitions.
 
-#define ZCAT            "/bin/gzip -dc"
+#define ZCAT            "/usr/bin/gzip -dc"
 #define BZCAT           "/usr/bin/bzip2 -dc"
-#define CAT             "/bin/cat"
+#define CAT             "/usr/bin/cat"
 
 struct trace {
 	bool	taken;
