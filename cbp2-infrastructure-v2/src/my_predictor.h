@@ -16,6 +16,7 @@
 #include <random>
 #include <cstdio>
 #include <cstdlib>
+#include <omp.h>
 
 // ─ Tunable parameters for the perceptron
 #define GLOBAL_HISTORY_LENGTH 64 // number of bits in shared global history
@@ -26,9 +27,9 @@
 #define WEIGHT_MIN -128
 
 // Number of samples to collect before retraining
-#define TRAINING_WINDOW 500000 // 1 million branches per window
+#define TRAINING_WINDOW 50000 // branches per window
 // Simulated delay (in branches) while “GPU” trains the MLP
-#define TRAINING_DELAY 5000 // i.e. 50k branches of delay before applying nudges
+#define TRAINING_DELAY 50 //  branches of delay before applying nudges
 
 // Dimensions for student (perceptron) vs teacher (MLP)
 static constexpr int STUDENT_DIMS = 1 + GLOBAL_HISTORY_LENGTH + LOCAL_HISTORY_LENGTH; // 1 bias + 64 global + 12 local = 77
@@ -341,79 +342,89 @@ private:
 	// loss with tanh activations. We train on all TRAINING_WINDOW samples.
 	void train_teacher()
 	{
-		const float lr = 0.01f; // learning rate
-		const int epochs = 3;	// number of passes over the buffer
+		const float lr = 0.01f;
+		const int epochs = 3;
 
-		// Temporary arrays for forward/backprop
-		float x_in[TEACHER_IN];
-		float hidden[TEACHER_HID];
-		float dhidden[TEACHER_HID];
-
-		for (int ep = 0; ep < epochs; ++ep)
+/* --- one OpenMP team for the whole routine ---------------------- */
+#pragma omp parallel
 		{
-			for (size_t idx = 0; idx < TRAINING_WINDOW; ++idx)
+			/* thread-private scratch buffers live on the stack */
+			float x_in[TEACHER_IN];
+			float hidden[TEACHER_HID], dhidden[TEACHER_HID];
+
+			/* thread-private gradient accumulators */
+			alignas(64) float dw1[TEACHER_HID][TEACHER_IN] = {{0}};
+			float db1[TEACHER_HID] = {0};
+			float dw2[TEACHER_HID] = {0};
+			float db2 = 0;
+
+			for (int ep = 0; ep < epochs; ++ep)
 			{
-				TraceSample &s = trace_buffer[idx];
-				// 1) Build teacher input vector x_in[0..75] = {±1 from ghist bits, ±1 from lhist bits}
-				unpack_teacher_input(s, x_in);
+				/* zero thread-local grads each epoch */
+				std::memset(dw1, 0, sizeof(dw1));
+				std::memset(db1, 0, sizeof(db1));
+				std::memset(dw2, 0, sizeof(dw2));
+				db2 = 0;
 
-				// Label y = +1 or -1
-				float y = s.taken ? +1.0f : -1.0f;
-
-				// 2) Forward pass: compute hidden activations (tanh)
-				for (int h = 0; h < TEACHER_HID; ++h)
+/* ------------ parallel over the whole window ------------ */
+#pragma omp for schedule(static)
+				for (long idx = 0; idx < TRAINING_WINDOW; ++idx)
 				{
-					float z = teacher_b1[h];
-					// dot product w1[h][*] · x_in[*]
-					float sum = 0.0f;
-					for (int i = 0; i < TEACHER_IN; ++i)
+					const TraceSample &s = trace_buffer[idx];
+
+					/* ---- build input vector {±1} ------------------------ */
+					unpack_teacher_input(s, x_in);
+
+					const float y = s.taken ? 1.0f : -1.0f;
+
+					/* ---- forward pass (vectorised dot products help) ---- */
+					for (int h = 0; h < TEACHER_HID; ++h)
 					{
-						sum += teacher_w1[h][i] * x_in[i];
+						float z = teacher_b1[h];
+						for (int i = 0; i < TEACHER_IN; ++i)
+							z += teacher_w1[h][i] * x_in[i];
+						hidden[h] = std::tanh(z);
 					}
-					z += sum;
-					hidden[h] = std::tanh(z);
-				}
-				// Output neuron (pre‐activation)
-				float z_out = teacher_b2;
-				for (int h = 0; h < TEACHER_HID; ++h)
-				{
-					z_out += teacher_w2[h] * hidden[h];
-				}
-				// Post-activation
-				float y_pred = std::tanh(z_out);
+					float z_out = teacher_b2;
+					for (int h = 0; h < TEACHER_HID; ++h)
+						z_out += teacher_w2[h] * hidden[h];
+					const float y_pred = std::tanh(z_out);
 
-				// 3) Backprop: mean-squared loss L = 0.5*(y_pred - y)^2
-				// dL/dz_out = (y_pred - y) * (1 - y_pred^2)
-				float d_out = (y_pred - y) * (1.0f - y_pred * y_pred);
+					/* ---- backward pass, **add to local grads** ---------- */
+					const float d_out = (y_pred - y) * (1 - y_pred * y_pred);
 
-				// 4) Gradients for w2, b2
-				for (int h = 0; h < TEACHER_HID; ++h)
-				{
-					float grad_w2 = d_out * hidden[h];
-					teacher_w2[h] -= lr * grad_w2;
-				}
-				teacher_b2 -= lr * d_out;
-
-				// 5) Backprop into hidden
-				for (int h = 0; h < TEACHER_HID; ++h)
-				{
-					// dL/dz_h = d_out * w2[h] * (1 - hidden[h]^2)
-					float d_hidden = d_out * teacher_w2[h] * (1.0f - hidden[h] * hidden[h]);
-					dhidden[h] = d_hidden;
-				}
-				// 6) Gradients for w1, b1
-				for (int h = 0; h < TEACHER_HID; ++h)
-				{
-					float grad_b1 = dhidden[h];
-					teacher_b1[h] -= lr * grad_b1;
-					for (int i = 0; i < TEACHER_IN; ++i)
+					for (int h = 0; h < TEACHER_HID; ++h)
 					{
-						float grad_w1 = dhidden[h] * x_in[i];
-						teacher_w1[h][i] -= lr * grad_w1;
+						dw2[h] += d_out * hidden[h]; // ∂L/∂w2
 					}
+					db2 += d_out; // ∂L/∂b2
+
+					for (int h = 0; h < TEACHER_HID; ++h)
+					{
+						const float g = d_out * teacher_w2[h] * (1 - hidden[h] * hidden[h]);
+						db1[h] += g; // ∂L/∂b1
+						for (int i = 0; i < TEACHER_IN; ++i)
+							dw1[h][i] += g * x_in[i]; // ∂L/∂w1
+					}
+				} /* end for TRAINING_WINDOW */
+
+/* ---- one thread at a time updates the real weights ---- */
+#pragma omp critical
+				{
+					for (int h = 0; h < TEACHER_HID; ++h)
+					{
+						teacher_w2[h] -= lr * dw2[h];
+						teacher_b1[h] -= lr * db1[h];
+						for (int i = 0; i < TEACHER_IN; ++i)
+							teacher_w1[h][i] -= lr * dw1[h][i];
+					}
+					teacher_b2 -= lr * db2;
 				}
-			}
-		}
+
+/* all threads wait before next epoch so weights are in sync */
+#pragma omp barrier
+			} /* end epochs */
+		} /* end parallel region */
 	}
 
 	// ─────────────────────────────────────────────────────────────────────
@@ -423,92 +434,74 @@ private:
 	// row’s accumulator to {+1, 0, -1} per weight, storing into row_deltas[].
 	void distill_teacher_to_student()
 	{
-		// Zero all accumulators
-		size_t num_rows = (1 << TABLE_BITS);
-		size_t stu_size = num_rows * STUDENT_DIMS;
+		const size_t num_rows = (1u << TABLE_BITS);
+		const size_t stu_size = num_rows * STUDENT_DIMS;
 		std::memset(accumulators, 0, sizeof(int32_t) * stu_size);
-
-		// For each sample in the buffer:
-		int x_stu[STUDENT_DIMS];  // student feature vector (±1 or bias=1)
-		float x_tchr[TEACHER_IN]; // teacher feature vector (±1)
-		float hidden[TEACHER_HID];
-
-		for (size_t idx = 0; idx < TRAINING_WINDOW; ++idx)
+/* -------- first pass: accumulate into thread-local buffers ---- */
+#pragma omp parallel
 		{
-			TraceSample &s = trace_buffer[idx];
-			uint16_t row = s.index;
+			int x_stu[STUDENT_DIMS];
+			float x_tchr[TEACHER_IN], hidden[TEACHER_HID];
 
-			// Build teacher input x_tchr[0..75]
-			unpack_teacher_input(s, x_tchr);
+			/* each thread gets its own slice */
+			std::vector<int32_t> acc_local(stu_size, 0);
 
-			// 1) Teacher forward (pre‐tanh output)
-			for (int h = 0; h < TEACHER_HID; ++h)
+#pragma omp for schedule(static)
+			for (long idx = 0; idx < TRAINING_WINDOW; ++idx)
 			{
-				float sum = teacher_b1[h];
-				for (int i = 0; i < TEACHER_IN; ++i)
+				const TraceSample &s = trace_buffer[idx];
+				const uint16_t row = s.index;
+
+				unpack_teacher_input(s, x_tchr);
+
+				/* teacher forward */
+				for (int h = 0; h < TEACHER_HID; ++h)
 				{
-					sum += teacher_w1[h][i] * x_tchr[i];
+					float z = teacher_b1[h];
+					for (int i = 0; i < TEACHER_IN; ++i)
+						z += teacher_w1[h][i] * x_tchr[i];
+					hidden[h] = std::tanh(z);
 				}
-				hidden[h] = std::tanh(sum);
-			}
-			float z_out = teacher_b2;
-			for (int h = 0; h < TEACHER_HID; ++h)
-			{
-				z_out += teacher_w2[h] * hidden[h];
-			}
-			// Teacher’s sign
-			int t_sign = (z_out >= 0.0f ? +1 : -1);
+				float z_out = teacher_b2;
+				for (int h = 0; h < TEACHER_HID; ++h)
+					z_out += teacher_w2[h] * hidden[h];
+				const int t_sign = (z_out >= 0) ? 1 : -1;
 
-			// 2) Student forward (pre‐activation)
-			//   sum = g_weights[row][0] * 1
-			//       + Σ (g_weights[row][i+1] * ±1 from ghist)
-			//       + Σ (l_weights[row][j] * ±1 from lhist)
-			int sum_s = g_weights[row][0];
-			// Unpack ghist from s.ghist
-			for (int i = 0; i < GLOBAL_HISTORY_LENGTH; ++i)
-			{
-				int bit = ((s.ghist & (uint64_t(1) << i)) ? +1 : -1);
-				sum_s += g_weights[row][i + 1] * bit;
-			}
-			// Unpack local from s.lhist
-			for (int j = 0; j < LOCAL_HISTORY_LENGTH; ++j)
-			{
-				int bit = ((s.lhist & (1u << j)) ? +1 : -1);
-				sum_s += l_weights[row][j] * bit;
-			}
-			int s_sign = (sum_s >= 0 ? +1 : -1);
-			int margin = std::abs(sum_s);
+				/* student forward (fast integer dot) */
+				int sum_s = g_weights[row][0];
+				for (int i = 0; i < GLOBAL_HISTORY_LENGTH; ++i)
+					sum_s += g_weights[row][i + 1] *
+						 ((s.ghist & (1ull << i)) ? +1 : -1);
+				for (int j = 0; j < LOCAL_HISTORY_LENGTH; ++j)
+					sum_s += l_weights[row][j] *
+						 ((s.lhist & (1u << j)) ? +1 : -1);
 
-			// 3) If teacher disagrees OR student margin ≤ (THRESHOLD/2), accumulate
-			if (t_sign != s_sign || margin <= (THRESHOLD / 2))
-			{
-				// Build student feature vector: x_stu[0]=1, x_stu[1..64]=ghist bits, x_stu[65..76]=lhist bits
-				build_student_input(s, x_stu);
+				const int margin = std::abs(sum_s);
+				const int s_sign = (sum_s >= 0) ? 1 : -1;
 
-				int32_t *acc_row = accumulators + (size_t)row * STUDENT_DIMS;
-				// For each student weight k:
-				for (int k = 0; k < STUDENT_DIMS; ++k)
+				if (t_sign != s_sign || margin <= (THRESHOLD / 2))
 				{
-					// add t_sign * x_stu[k] to accumulator
-					acc_row[k] += (int32_t)(t_sign * x_stu[k]);
+					build_student_input(s, x_stu);
+					int32_t *acc_row = acc_local.data() + (size_t)row * STUDENT_DIMS;
+					for (int k = 0; k < STUDENT_DIMS; ++k)
+						acc_row[k] += t_sign * x_stu[k];
 				}
-			}
-		}
+			} /* end window loop */
 
-		// 4) Quantize each accumulator → {-1,0,+1} and store in row_deltas
-		for (size_t row = 0; row < num_rows; ++row)
+/* ------ merge local→global once, outside the hot loop ------ */
+#pragma omp critical
+			for (size_t i = 0; i < stu_size; ++i)
+				accumulators[i] += acc_local[i];
+		} /* end parallel */
+
+/* -------- second pass: quantise -------- */
+#pragma omp parallel for schedule(static)
+		for (long row = 0; row < (1 << TABLE_BITS); ++row)
 		{
 			int32_t *acc_row = accumulators + row * STUDENT_DIMS;
 			int8_t *del_row = row_deltas + row * STUDENT_DIMS;
 			for (int k = 0; k < STUDENT_DIMS; ++k)
-			{
-				if (acc_row[k] > 0)
-					del_row[k] = +1;
-				else if (acc_row[k] < 0)
-					del_row[k] = -1;
-				else
-					del_row[k] = 0;
-			}
+				del_row[k] = (acc_row[k] > 0) - (acc_row[k] < 0); // {-1,0,+1}
 		}
 	}
 

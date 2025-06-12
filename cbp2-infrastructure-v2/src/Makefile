@@ -1,5 +1,5 @@
 CXX		=	g++
-CXXFLAGS	=	-g -O3 -Wall
+CXXFLAGS	=	-g -O3 -Wall -fopenmp
 
 all:		predict
 
