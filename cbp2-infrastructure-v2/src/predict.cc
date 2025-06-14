@@ -12,7 +12,7 @@
 #include "branch.h"
 #include "trace.h"
 #include "predictor.h"
-#include "my_predictor.h"
+#include "my_predictor_gpu_hist.h"
 
 int main (int argc, char *argv[]) {
 
